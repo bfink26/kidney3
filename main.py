@@ -172,6 +172,8 @@ class _StreamingCompatContext:
         self.updater = streaming.updater
         self.request_context = streaming.request_context
         self._documents = None
+        # Ensures the task stream reaches a terminal state (completed/failed)
+        self._terminal_sent = False
 
     @property
     def document_client(self):
@@ -209,10 +211,11 @@ class _StreamingCompatContext:
         We include progress + importance in event metadata so UIs can render it
         if they choose to.
         """
-        meta: dict[str, Any] = {
-            "task_status": status,
-            "importance": importance.value,
-        }
+        # Always stream non-terminal status updates.
+        # Terminal completion/failure is emitted explicitly in `handle_request()` to satisfy
+        # runtimes that require a dedicated terminal event.
+        normalized = (status or "working").strip().lower()
+        meta: dict[str, Any] = {"task_status": normalized, "importance": importance.value}
         if progress is not None:
             meta["progress"] = float(progress)
 
@@ -221,13 +224,7 @@ class _StreamingCompatContext:
             role=Role.agent,
             parts=[Part(root=TextPart(text=message))],
         )
-        # Keep task in a working state as we stream updates.
-        await self.updater.update_status(
-            state=TaskState.working,
-            message=msg,
-            final=False,
-            metadata=meta,
-        )
+        await self.updater.update_status(state=TaskState.working, message=msg, final=False, metadata=meta)
 
     async def add_artifact(
         self,
@@ -341,9 +338,45 @@ class MyAgent(Agent):
 
         compat = _StreamingCompatContext(context)
         try:
-            return await self.process_message(message, compat)  # type: ignore[arg-type]
+            result = await self.process_message(message, compat)  # type: ignore[arg-type]
+
+            # Some runtimes require an explicit terminal state event; otherwise they surface:
+            # "stream ended without reaching terminal state".
+            await self._emit_terminal(context, ok=True, text="Complete.")
+
+            return result
+        except Exception as e:
+            # Ensure we always end in a terminal state even on errors.
+            await self._emit_terminal(context, ok=False, text=f"Failed: {e}")
+            # Return None to avoid the framework closing the stream without a terminal event.
+            return None
         finally:
+            # Normal path cleanup
             await compat.close()
+
+    async def _emit_terminal(self, context: StreamingContext, ok: bool, text: str) -> None:
+        """Emit a terminal task state in the most compatible way across runtimes."""
+        msg = Message(
+            message_id=str(uuid.uuid4()),
+            role=Role.agent,
+            parts=[Part(root=TextPart(text=text))],
+        )
+
+        # Prefer dedicated helpers if the runtime provides them.
+        if ok and hasattr(context.updater, "complete"):
+            await context.updater.complete(message=msg)
+            return
+        if (not ok) and hasattr(context.updater, "fail"):
+            await context.updater.fail(message=msg)
+            return
+
+        # Fallback: update_status with final=True.
+        await context.updater.update_status(
+            state=TaskState.completed if ok else TaskState.failed,
+            message=msg,
+            final=True,
+            metadata={"task_status": "completed" if ok else "failed"},
+        )
 
 
     async def process_message(self, message: str, context: AgentContext) -> str:
