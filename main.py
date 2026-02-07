@@ -20,6 +20,8 @@ Your agent will be available at http://localhost:8000
 
 from __future__ import annotations
 
+import base64
+
 import io
 import json
 import math
@@ -83,6 +85,13 @@ if poppler_path:
 else:
     print("WARNING: poppler not found. PDF processing may fail.")
     print("Install with: apt-get install poppler-utils (Linux) or brew install poppler (macOS)")
+
+
+
+
+def _b64(data: bytes) -> str:
+    """Base64-encode bytes for A2A FileWithBytes."""
+    return base64.b64encode(data).decode('utf-8')
 
 
 # ---------- Data models ----------
@@ -211,11 +220,10 @@ class _StreamingCompatContext:
         We include progress + importance in event metadata so UIs can render it
         if they choose to.
         """
-        # Always stream non-terminal status updates.
-        # Terminal completion/failure is emitted explicitly in `handle_request()` to satisfy
-        # runtimes that require a dedicated terminal event.
+        # Stream non-terminal status updates. The SDK will emit the terminal
+        # completion state after handle_request() returns.
         normalized = (status or "working").strip().lower()
-        meta: dict[str, Any] = {"task_status": normalized, "importance": importance.value}
+        meta: dict[str, Any] = {"task_status": normalized, HU_LOG_LEVEL_EXTENSION_URI: {"importance": importance.value}}
         if progress is not None:
             meta["progress"] = float(progress)
 
@@ -251,7 +259,7 @@ class _StreamingCompatContext:
             parts = [
                 Part(
                     root=FilePart(
-                        file=FileWithBytes(bytes=content, mime_type=data_type, name=name),
+                        file=FileWithBytes(bytes=_b64(content), mime_type=data_type, name=name),
                     )
                 )
             ]
@@ -338,46 +346,23 @@ class MyAgent(Agent):
 
         compat = _StreamingCompatContext(context)
         try:
+            # Run the work synchronously in the request stream.
+            # When this returns, the SDK will emit a TaskState.completed terminal event.
             result = await self.process_message(message, compat)  # type: ignore[arg-type]
-
-            # Some runtimes require an explicit terminal state event; otherwise they surface:
-            # "stream ended without reaching terminal state".
-            await self._emit_terminal(context, ok=True, text="Complete.")
-
             return result
         except Exception as e:
-            # Ensure we always end in a terminal state even on errors.
-            await self._emit_terminal(context, ok=False, text=f"Failed: {e}")
-            # Return None to avoid the framework closing the stream without a terminal event.
+            # Ensure the stream reaches a terminal state on errors.
+            fail_msg = Message(
+                message_id=str(uuid.uuid4()),
+                role=Role.agent,
+                parts=[Part(root=TextPart(text=f"Task failed: {e}"))],
+            )
+            await context.updater.failed(message=fail_msg)
             return None
+
         finally:
             # Normal path cleanup
             await compat.close()
-
-    async def _emit_terminal(self, context: StreamingContext, ok: bool, text: str) -> None:
-        """Emit a terminal task state in the most compatible way across runtimes."""
-        msg = Message(
-            message_id=str(uuid.uuid4()),
-            role=Role.agent,
-            parts=[Part(root=TextPart(text=text))],
-        )
-
-        # Prefer dedicated helpers if the runtime provides them.
-        if ok and hasattr(context.updater, "complete"):
-            await context.updater.complete(message=msg)
-            return
-        if (not ok) and hasattr(context.updater, "fail"):
-            await context.updater.fail(message=msg)
-            return
-
-        # Fallback: update_status with final=True.
-        await context.updater.update_status(
-            state=TaskState.completed if ok else TaskState.failed,
-            message=msg,
-            final=True,
-            metadata={"task_status": "completed" if ok else "failed"},
-        )
-
 
     async def process_message(self, message: str, context: AgentContext) -> str:
         await context.update_progress("Parsing kidney intake...", progress=0.1)
