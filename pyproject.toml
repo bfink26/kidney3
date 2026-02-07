@@ -1,11 +1,15 @@
 [project]
-name = "my-a2a-agent"
+name = "kidney-transport-a2a-agent"
 version = "0.1.0"
-description = "A Health Universe A2A Agent"
+description = "Kidney recipient + preservation recommendation agent (Health Universe A2A)"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "health-universe-a2a>=0.2.0"
+    "health-universe-a2a>=0.2.0",
+    "openai>=1.40.0",
+    "pandas>=2.2.0",
+    "requests>=2.32.0",
+    "scikit-learn>=1.5.0",
 ]
 
 [project.optional-dependencies]
